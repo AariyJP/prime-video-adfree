@@ -62,14 +62,43 @@ nav[data-testid="pv-navigation-bar"] [data-testid="pv-nav-branding"] {
     max-width: none !important;
 }
 
+a[data-pvt-rich-presence] {
+    display: inline-flex !important;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+}
+a[data-pvt-rich-presence]::before {
+    content: '';
+    flex: none;
+    width: 14px;
+    height: 14px;
+    border: 2px solid #8c8c8c;
+    border-radius: 3px;
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 14px;
+    text-align: center;
+}
+a[data-pvt-rich-presence][aria-checked="true"]::before {
+    content: '✓';
+    border-color: #1a98ff;
+    background: #1a98ff;
+}
+
 .tooltip {
     -webkit-app-region: no-drag !important;
 }
 
-.pvt-in-player .pvt-player-topbar {
+.pvt-in-player .pvt-player-topbar,
+.pvt-in-player .atvwebplayersdk-top-left-regulatory-overlay {
     transform: translateY(60px) !important;
 }
-:fullscreen .pvt-player-topbar {
+.pvt-player-topbar .atvwebplayersdk-top-left-regulatory-overlay,
+:fullscreen .pvt-player-topbar,
+:fullscreen .atvwebplayersdk-top-left-regulatory-overlay {
     transform: none !important;
 }
 .atvwebplayersdk-title-text,

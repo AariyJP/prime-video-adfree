@@ -1,5 +1,5 @@
 use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
@@ -8,10 +8,13 @@ struct DiscordState {
 }
 
 fn make_activity() -> activity::Activity<'static> {
-    let start_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    static START_TIME: OnceLock<u64> = OnceLock::new();
+    let start_time = *START_TIME.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    });
 
     activity::Activity::new()
         .activity_type(activity::ActivityType::Watching)
@@ -25,6 +28,158 @@ fn make_activity() -> activity::Activity<'static> {
         .timestamps(activity::Timestamps::new().start(start_time as i64))
 }
 
+fn fit_activity_text(text: &str) -> String {
+    let mut fitted = if text.encode_utf16().count() <= 128 {
+        text.to_string()
+    } else {
+        let mut cut = String::new();
+        for c in text.chars() {
+            if cut.encode_utf16().count() + c.len_utf16() > 127 {
+                break;
+            }
+            cut.push(c);
+        }
+        cut.push('…');
+        cut
+    };
+    while fitted.encode_utf16().count() < 2 {
+        fitted.push('\u{2800}');
+    }
+    fitted
+}
+
+#[tauri::command]
+fn update_activity(
+    discord: tauri::State<DiscordState>,
+    details: Option<String>,
+    status: Option<String>,
+    image: Option<String>,
+    start: Option<i64>,
+    end: Option<i64>,
+) {
+    let details = details.as_deref().map(fit_activity_text);
+    let status = status.as_deref().map(fit_activity_text);
+    let image = image.filter(|image| image.len() <= 256);
+    let mut client_lock = discord.client.lock().unwrap();
+    let Some(client) = client_lock.as_mut() else {
+        return;
+    };
+    let Some(details) = details.as_deref() else {
+        if client.set_activity(make_activity()).is_ok() {
+            let _ = client.recv();
+        }
+        return;
+    };
+    let mut act: activity::Activity = make_activity().details(details);
+    if let Some(status) = status.as_deref() {
+        act = act.state(status);
+    }
+    if let Some(image) = image.as_deref() {
+        act = act.assets(activity::Assets::new().large_image(image).large_text(details));
+    }
+    if let (Some(start), Some(end)) = (start, end) {
+        act = act.timestamps(activity::Timestamps::new().start(start).end(end));
+    }
+    if client.set_activity(act).is_err() {
+        println!("Failed to set Discord activity.");
+    } else {
+        let _ = client.recv();
+    }
+}
+
+fn adguard_path() -> String {
+    let exe_path = std::env::current_exe().expect("Failed to get current exe path");
+    let exe_dir = if cfg!(dev) {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    } else {
+        exe_path.parent().expect("Failed to get parent directory")
+    };
+    exe_dir.join("adg").to_str().unwrap().to_string()
+}
+
+fn cef_runtime() -> tauri_runtime_cef::Cef {
+    let cef = tauri_runtime_cef::Cef::default()
+        .command_line_arg("--load-extension", Some(adguard_path()))
+        .command_line_arg("--disable-gpu", None::<String>);
+    if cfg!(debug_assertions) {
+        cef.remote_debugging(tauri_runtime_cef::RemoteDebugging::Port {
+            port: 9222,
+            allowed_origins: Vec::new(),
+        })
+    } else {
+        cef
+    }
+}
+
+fn extension_id(path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes: Vec<u8> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    Sha256::digest(&bytes)[..16]
+        .iter()
+        .flat_map(|b| [b >> 4, b & 0x0f])
+        .map(|n| (b'a' + n) as char)
+        .collect()
+}
+
+#[tauri::command]
+async fn open_extension_page(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let url = tauri::Url::parse(&url).map_err(|e| e.to_string())?;
+    if matches!(url.scheme(), "http" | "https") {
+        return app
+            .opener()
+            .open_url(url.as_str(), None::<&str>)
+            .map_err(|e| e.to_string());
+    }
+    if url.scheme() != "chrome-extension"
+        || url.host_str() != Some(extension_id(&adguard_path()).as_str())
+    {
+        return Err("unsupported url".into());
+    }
+    let page = url
+        .path()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".html")
+        .to_string();
+    let label = format!("adguard-{}", page);
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.unminimize();
+        return window.set_focus().map_err(|e| e.to_string());
+    }
+    tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::External(url))
+        .title("AdGuard")
+        .inner_size(1100.0, 800.0)
+        .background_color(tauri::utils::config::Color(45, 45, 45, 255))
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn refresh_extension_worker(app: &tauri::App) {
+    use sha2::{Digest, Sha256};
+    let adg = std::path::PathBuf::from(adguard_path());
+    let mut hasher = Sha256::new();
+    for file in ["manifest.json", "pvt-background.js", "pages/background.js"] {
+        hasher.update(std::fs::read(adg.join(file)).unwrap_or_default());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    let Ok(dir) = app.path().app_cache_dir().map(|dir| dir.join("cef")) else {
+        return;
+    };
+    let marker = dir.join("adg-digest");
+    if std::fs::read_to_string(&marker).ok().as_deref() == Some(digest.as_str()) {
+        return;
+    }
+    for profile in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let worker = profile.path().join("Service Worker");
+        let _ = std::fs::remove_dir_all(worker.join("ScriptCache"));
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(marker, digest);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     use std::env;
@@ -34,6 +189,7 @@ pub fn run() {
     };
 
     tauri::Builder::default()
+        .runtime(cef_runtime())
         .manage(discord_state)
         .setup(move |app| {
             let handle = app.handle();
@@ -50,17 +206,9 @@ pub fn run() {
                 println!("Failed to connect to Discord.");
             }
 
-            let exe_path = std::env::current_exe().expect("Failed to get current exe path");
-            let exe_dir = exe_path.parent().expect("Failed to get parent directory");
+            refresh_extension_worker(app);
 
-            let cdp_flag = if cfg!(debug_assertions) {
-                " --remote-debugging-port=9222"
-            } else {
-                ""
-            };
-
-            #[allow(unused_mut)]
-            let mut builder = tauri::WebviewWindowBuilder::new(
+            tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
                 tauri::WebviewUrl::App("https://www.amazon.co.jp/gp/video/storefront".into()),
@@ -70,27 +218,13 @@ pub fn run() {
             .min_inner_size(990.0, 600.0)
             .background_color(tauri::utils::config::Color(45, 45, 45, 255))
             .decorations(false)
-            .browser_extensions_enabled(true)
-            .additional_browser_args(
-                format!(
-                    "--load-extension={} --disable-gpu{}",
-                    exe_dir.join("adg").to_str().unwrap(),
-                    cdp_flag
-                )
-                .as_str(),
-            );
-
-            #[cfg(target_os = "windows")]
-            {
-                builder = builder
-                    .initialization_script(include_str!(concat!(env!("OUT_DIR"), "/inject.js")));
-            }
-
-            builder.build()?;
+            .initialization_script(include_str!(concat!(env!("OUT_DIR"), "/inject.js")))
+            .build()?;
 
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![update_activity, open_extension_page])
         .run(tauri::generate_context!())
         .expect("アプリケーションの起動中にエラーが発生しました。");
 }
